@@ -1,0 +1,4 @@
+interface:
+  display_name: "YouTube VOC Collector"
+  short_description: "Preserve raw public YouTube comments for Amazon ASIN research."
+  default_prompt: "Use $youtube-voc-collector with my Amazon ASIN or ASIN group to collect all visible public YouTube comments and replies without content filtering."

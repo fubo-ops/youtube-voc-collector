@@ -1,0 +1,36 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+        python: ["3.10", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+      - run: python -m pip install .
+      - run: npm ci
+      - run: python -m unittest discover -s tests -v
+      - run: npm test
+      - run: npm run check
+      - run: python scripts/quick_validate.py .
+      - if: runner.os == 'Windows' && matrix.python == '3.13'
+        shell: powershell
+        run: .\build_release.ps1
