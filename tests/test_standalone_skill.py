@@ -30,10 +30,14 @@ class StandaloneYouTubeSkillTests(unittest.TestCase):
         for name in required:
             self.assertTrue((ROOT / name).is_file(), name)
 
+        text_suffixes = {".md", ".yaml", ".yml", ".py", ".cjs", ".mjs", ".js", ".ps1", ".cmd", ".json", ".toml", ".txt"}
+        excluded = {".git", "node_modules", "__pycache__", "dist", "outputs"}
         text = "\n".join(
             path.read_text(encoding="utf-8")
             for path in ROOT.rglob("*")
-            if path.is_file() and "__pycache__" not in path.parts and "dist" not in path.parts
+            if path.is_file()
+            and not any(part in excluded for part in path.parts)
+            and (path.suffix.lower() in text_suffixes or path.name in {"LICENSE", "VERSION"})
         )
         legacy_root = "D:" + "\\Project\\2026\\SKILL\\" + "VOC"
         legacy_relative = ".." + "/voc-"
