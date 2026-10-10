@@ -1,6 +1,6 @@
 {
   "name": "youtube-voc-collector",
-  "version": "1.0.0-rc1",
+  "version": "1.1.0",
   "private": true,
   "description": "Public YouTube VOC comment collector and Codex Skill",
   "license": "MIT",

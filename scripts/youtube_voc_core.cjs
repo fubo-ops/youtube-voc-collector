@@ -3,8 +3,15 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const ASIN_RE = /^[A-Z0-9]{10}$/;
-const BROAD = new Set(['dog','dogs','joint','joints','pet','pets']);
+const BROAD = new Set(['product','products','item','items','review','reviews','best','buy']);
 const BLOCKED = new Set(['captcha','login_required','age_restricted','region_restricted','rate_limited','access_denied','member_only','private_video']);
+const STOP_WORDS = new Set(['a','an','and','are','as','at','be','by','for','from','in','is','it','of','on','or','the','this','to','with','your']);
+const SPECIES = {
+  dog:/\b(?:dog|dogs|puppy|puppies|pup|canine)\b/i,
+  cat:/\b(?:cat|cats|kitten|kittens|feline)\b/i,
+  horse:/\b(?:horse|horses|equine)\b/i,
+  human:/\b(?:human|humans|men|women|people|person)\b/i,
+};
 
 function unique(values) {
   const seen = new Set();
@@ -46,10 +53,11 @@ function dedupeVideos(rows) {
   const map = new Map();
   for (const source of rows || []) {
     if (!source.video_id) continue;
-    const row = map.get(source.video_id) || {...source, matched_queries:[], matched_keywords:[], matched_asins:[]};
+    const row = map.get(source.video_id) || {...source, matched_queries:[], matched_keywords:[], matched_asins:[], keyword_sources:[]};
     row.matched_queries = unique([...row.matched_queries, source.matched_query, ...(source.matched_queries || [])]);
     row.matched_keywords = unique([...row.matched_keywords, ...(source.matched_keywords || [])]);
     row.matched_asins = unique([...row.matched_asins, ...(source.matched_asins || source.asins || [])]);
+    row.keyword_sources = unique([...row.keyword_sources, ...(source.keyword_sources || [])]);
     map.set(source.video_id,row);
   }
   return [...map.values()];
@@ -103,41 +111,113 @@ function matchingTerms(text, terms) {
   return unique((terms || []).filter(term => lower.includes(String(term).toLowerCase())));
 }
 
+function phrases(values, pattern) {
+  return unique((values || []).map(value=>String(value || '').replace(/\s+/g,' ').trim()).filter(value=>value && (!pattern || pattern.test(value))));
+}
+
+function inferSpecies(text) {
+  return Object.entries(SPECIES).find(([,pattern])=>pattern.test(String(text || '')))?.[0] || null;
+}
+
+function compact(value, maxWords = 8) {
+  return String(value || '').replace(/[^a-z0-9&+/' -]+/gi,' ').replace(/\s+/g,' ').trim().split(/\s+/).slice(0,maxWords).join(' ');
+}
+
+function buildProductContext(raw = {}) {
+  const title = compact(raw.product_title || raw.title || raw.asin, 12);
+  const bullets = phrases(raw.core_attributes || raw.bullets || []);
+  const sellerKeywords = phrases(raw.seller_keywords || []);
+  const corpus = `${title} ${bullets.join(' ')} ${sellerKeywords.join(' ')}`;
+  const meaningfulTitle = title.split(/\s+/).filter(word=>word.length > 1 && !STOP_WORDS.has(word.toLowerCase()));
+  const productName = compact(raw.product_name || title, 7);
+  const category = compact(raw.category || sellerKeywords.find(value=>value.split(/\s+/).length <= 5) || meaningfulTitle.slice(-4).join(' '),5);
+  const useCases = phrases([...(raw.use_cases || []),...bullets],/\b(?:for|during|serve|serving|use|using|when|while|with)\b/i);
+  const problems = phrases([...(raw.user_problems || []),...(raw.pain_points || []),...bullets],/\b(?:reduce|prevent|relief|anxiety|boredom|pain|stress|difficulty|slow|bloat|mess|problem)\w*\b/i);
+  const effects = phrases([...(raw.primary_functions || []),...bullets],/\b(?:support|promot|improv|reduc|help|keep|encourag|protect|calm|engag)\w*\b/i);
+  const components = phrases([...(raw.ingredients_or_components || []),...bullets],/\b(?:with|contain|ingredient|material|made of|construction|formula|base)\b/i);
+  const attributes = unique([...(raw.core_attributes || []),...bullets,...sellerKeywords]).slice(0,24);
+  const alternatives = unique([...(raw.competing_products || []),...sellerKeywords.filter(value=>/\b(?:vs|versus|alternative|compare|comparison)\b/i.test(value))]);
+  const brand = compact(raw.brand || meaningfulTitle.slice(0,2).join(' '),4);
+  return {
+    ...raw,
+    asin:raw.asin,
+    title,
+    product_title:title,
+    product_name:productName,
+    brand,
+    category,
+    target_species:raw.target_species || inferSpecies(corpus),
+    common_product_names:unique([productName,title,...(raw.common_product_names || []),...sellerKeywords.slice(0,4)]),
+    core_attributes:attributes,
+    primary_functions:effects,
+    ingredients_or_components:components,
+    use_cases:useCases,
+    user_problems:problems,
+    pain_points:unique([...(raw.pain_points || []),...problems]),
+    competing_products:alternatives,
+    purchase_intents:unique([...(raw.purchase_intents || []),'review','best','worth it','price','where to buy']),
+    seller_keywords:sellerKeywords,
+  };
+}
+
+function buildProductQueries(productContexts = []) {
+  const out = [], seen = new Set();
+  const add = (context, family, phrase, suffix='') => {
+    const anchor = compact(context.product_name || context.product_title || context.asin,3);
+    const value = compact(phrase,5);
+    const query = compact(`${anchor} ${suffix} ${keywordSignature(value) === keywordSignature(anchor) ? '' : value}`,12);
+    const key = keywordSignature(query);
+    if (!query || seen.has(key)) return;
+    seen.add(key);
+    out.push({query,query_family:family,dimension:family,generation_source:'product_context',source_video_ids:[],evidence_comment_ids:[],matched_asins:[context.asin].filter(Boolean),asins:[context.asin].filter(Boolean),keyword_sources:[`product_context:${family}`],semantic_link:`${family} from Amazon/SellerSprite product context`,priority:90,executed:false,videos_found:0,marginal_yield:0});
+  };
+  for (const source of productContexts) {
+    const context = buildProductContext(source);
+    for (const suffix of ['review','demo','how to use','customer experience']) add(context,'product',context.product_name,suffix);
+    for (const suffix of ['review','best options','comparison']) add(context,'category',context.category,suffix);
+    for (const value of (context.core_attributes.length?context.core_attributes:[context.category]).slice(0,4)) add(context,'attribute',value,'feature review');
+    for (const value of (context.use_cases.length?context.use_cases:[context.category]).slice(0,4)) add(context,'use_case',value,'how to use');
+    for (const value of (context.user_problems.length?context.user_problems:[context.category]).slice(0,4)) add(context,'problem',value,'problem solution');
+    for (const value of (context.primary_functions.length?context.primary_functions:[context.category]).slice(0,4)) add(context,'effect',value,'benefits results');
+    for (const value of (context.ingredients_or_components.length?context.ingredients_or_components:[context.category]).slice(0,4)) add(context,'component',value,'materials ingredients');
+    for (const intent of context.purchase_intents.slice(0,6)) add(context,'purchase_intent',intent,'buying guide');
+    for (const value of (context.competing_products.length?context.competing_products:[context.category]).slice(0,3)) add(context,'alternative',value,'alternatives comparison');
+    for (const keyword of context.seller_keywords.slice(0,12)) add(context,'seller_keyword',keyword);
+  }
+  return out;
+}
+
 function buildConversationMap(productContexts = []) {
-  const words = value => String(value || '').toLowerCase().replace(/[^a-z0-9\s-]/g,' ').split(/\s+/).filter(word => word.length > 2 && !BROAD.has(word));
-  const products = productContexts.map(context => {
-    const titleWords = words(context.product_title || context.title);
-    const brand = context.brand || titleWords.slice(0,2).join(' ');
-    const productNames = unique([context.product_title || context.title, ...((context.common_product_names || []))]);
-    const functions = unique([...(context.primary_functions || []),...(context.user_problems || []),...(context.pain_points || [])]);
-    return {asin:context.asin,product_title:context.product_title || context.title || null,brand,category:context.category || null,common_product_names:productNames,core_attributes:context.core_attributes || context.bullets || [],primary_functions:functions,ingredients_or_components:context.ingredients_or_components || [],use_cases:context.use_cases || [],user_problems:context.user_problems || [],pain_points:context.pain_points || [],competing_products:context.competing_products || [],amazon_status:context.status || context.amazon_status || 'available',amazon_login_status:context.amazon_login_status || 'not_required',sellersprite_status:context.seller_status || 'unavailable',sellersprite_extension_status:context.sellersprite_extension_status || 'not_used',sellersprite_missing_reason:context.seller_note || null};
-  });
-  const corpus = products.map(p=>`${p.product_title || ''} ${(p.core_attributes || []).join(' ')}`).join(' ').toLowerCase();
-  const targetSpecies = /\bdogs?\b/.test(corpus) ? 'dog' : /\bcats?\b/.test(corpus) ? 'cat' : null;
-  const titleNeeds = targetSpecies === 'dog' ? ['dog mobility','senior dog','dog arthritis','dog joint','joint pain','hip pain','knee pain','stiffness','stiff','limping','limp','climb stairs','stairs','acl','cruciate','glucosamine','chondroitin','msm','side effects','dosage'] : [];
+  const products = productContexts.map(buildProductContext);
+  const targetSpecies = unique(products.map(p=>p.target_species).filter(Boolean))[0] || null;
   const directTerms = unique(products.flatMap(p=>{
     const brand=String(p.brand || '').trim(), brandWords=brand.split(/\s+/).filter(Boolean);
-    return [brand,brandWords.at(-1),...p.common_product_names].filter(Boolean);
+    return [brand,brandWords.length > 1 ? brandWords.at(-1) : null,...p.common_product_names].filter(Boolean);
   }));
-  return {schema_version:'youtube_conversation_map_v1',products,direct_terms:directTerms,competitive_terms:unique(products.flatMap(p=>p.competing_products)),need_terms:unique([...products.flatMap(p=>[...p.primary_functions,...p.use_cases,...p.user_problems,...p.pain_points]),...titleNeeds]),target_species:targetSpecies,created_at:new Date().toISOString()};
+  const categoryTerms = unique(products.flatMap(p=>[p.category,...p.seller_keywords].filter(Boolean)));
+  const needTerms = unique(products.flatMap(p=>[...p.primary_functions,...p.use_cases,...p.user_problems,...p.pain_points,...p.ingredients_or_components]));
+  return {schema_version:'youtube_conversation_map_v2',products,direct_terms:directTerms,category_terms:categoryTerms,competitive_terms:unique(products.flatMap(p=>p.competing_products)),need_terms:needTerms,semantic_terms:unique([...directTerms,...categoryTerms,...needTerms]),target_species:targetSpecies,created_at:new Date().toISOString()};
 }
 
 function scoreVideoRelevance(video, map) {
   const text = `${video.title || ''} ${video.description || ''}`;
   const title = String(video.title || '');
-  const direct = matchingTerms(text,map.direct_terms), competitive = matchingTerms(text,map.competitive_terms), need = matchingTerms(text,map.need_terms);
+  const direct = matchingTerms(text,map.direct_terms), category = matchingTerms(text,map.category_terms), competitive = matchingTerms(text,map.competitive_terms), need = matchingTerms(text,map.need_terms);
   const lowerTitle = title.toLowerCase();
-  const mismatch = map.target_species === 'dog' && /\b(?:horse|equine|human|men|women|cat|feline)\b/.test(lowerTitle) && !/\bdogs?\b/.test(lowerTitle);
-  const speciesContext = map.target_species !== 'dog' || /\bdogs?\b/.test(lowerTitle);
-  const hits = unique([...direct,...competitive,...need]);
-  const relevant = !mismatch && (direct.length > 0 || (speciesContext && (competitive.length > 0 || need.length > 0)));
-  return {relevant,relevance_score:relevant?Math.min(1,hits.length / 3):0,evidence_terms:hits,rejection_reason:mismatch?'species_mismatch':relevant?'matched_semantics':'missing_product_or_species_anchor'};
+  const ownSpecies = map.target_species && SPECIES[map.target_species]?.test(lowerTitle);
+  const mismatch = Boolean(map.target_species && Object.entries(SPECIES).some(([name,pattern])=>name !== map.target_species && pattern.test(lowerTitle)) && !ownSpecies);
+  const asmrDrift = /\basmr\b/i.test(lowerTitle) && !/\b(?:review|how to|use|recipe|test|comparison)\b/i.test(lowerTitle);
+  const speciesContext = !map.target_species || ownSpecies;
+  const hits = unique([...direct,...category,...competitive,...need]);
+  const relevant = !mismatch && !asmrDrift && (direct.length > 0 || (speciesContext && (category.length > 0 || competitive.length > 0 || need.length > 0)));
+  const rejectionReason = mismatch?'species_mismatch':asmrDrift?'unrelated_asmr':relevant?'matched_semantics':'cross_category_or_missing_product_anchor';
+  return {relevant,relevance_score:relevant?Math.min(1,hits.length / 3):0,evidence_terms:hits,rejection_reason:rejectionReason};
 }
 
 function classifyCommentRelevance(comment, map) {
   const body = comment.body ?? comment.content?.text ?? '';
   const direct = matchingTerms(body,map.direct_terms), competitive = matchingTerms(body,map.competitive_terms), need = matchingTerms(body,map.need_terms);
-  const speciesContext = map.target_species !== 'dog' || /\b(?:dog|dogs|puppy|pup|canine)\b/i.test(body);
+  const speciesContext = !map.target_species || !SPECIES[map.target_species] || SPECIES[map.target_species].test(body);
   const [tier,hits,link] = direct.length ? ['direct_product',direct,'explicit product or brand mention']
     : competitive.length && speciesContext ? ['competitive_context',competitive,'same-category alternative or comparison']
     : need.length && speciesContext ? ['unmet_need',need,'product-relevant dog problem or use context'] : ['irrelevant',[],'no supported semantic link'];
@@ -165,7 +245,7 @@ function reconcileVideoAudits(rows, audits = {}) {
 function countTrustedUnique(rows) { return partitionRecords(rows).trusted.length; }
 
 function emptyCheckpoint() {
-  return {schema_version:'youtube_checkpoint_v2_raw',input_asins:[],product_contexts:[],query_plan:[],searched_queries:[],completed_video_ids:[],partial_video_ids:[],blocked_video_ids:[],collected_comment_ids:[],expanded_reply_controls:[],incomplete_frontier:[],discovery_round:1,raw_captured_count:0,technical_duplicate_count:0,final_collected_count:0,duplicate_count:0,filtered_count:0,stop_reason:null,video_audits:{},updated_at:new Date().toISOString()};
+  return {schema_version:'youtube_checkpoint_v3_raw',input_asins:[],product_contexts:[],query_plan:[],candidate_pool:[],searched_queries:[],completed_video_ids:[],partial_video_ids:[],blocked_video_ids:[],collected_comment_ids:[],expanded_reply_controls:[],incomplete_frontier:[],discovery_round:1,raw_captured_count:0,technical_duplicate_count:0,final_collected_count:0,duplicate_count:0,filtered_count:0,stop_reason:null,video_audits:{},updated_at:new Date().toISOString()};
 }
 function migrateCheckpoint(value = {}) { return {...emptyCheckpoint(),...value,video_audits:{...(value.video_audits || {})}}; }
 function loadCheckpoint(file) { return migrateCheckpoint(JSON.parse(fs.readFileSync(file,'utf8'))); }
@@ -181,19 +261,24 @@ function shouldVisitVideo(checkpoint, videoId, options = {}) {
   return true;
 }
 function requeueQueriesForResume(checkpoint, targetComments) {
-  if (!checkpoint || Number(checkpoint.final_collected_count ?? checkpoint.trusted_comment_count ?? 0) >= Number(targetComments)) return 0;
-  if ((checkpoint.candidate_pool || []).length) return 0;
-  const plan = checkpoint.query_plan || [];
-  let round = Number(checkpoint.discovery_round || 1);
-  if (!plan.some(row => Number(row.discovery_round || 1) === round)) {
-    round = Math.max(1,...plan.filter(row=>row.executed).map(row=>Number(row.discovery_round || 1)));
-    checkpoint.discovery_round = round;
+  void targetComments;
+  return checkpoint ? 0 : 0;
+}
+
+function mergeResumeQueries(checkpoint, incoming = []) {
+  const plan = checkpoint.query_plan || (checkpoint.query_plan=[]);
+  const used = new Set(plan.map(row=>keywordSignature(row.query)));
+  const pendingRounds = plan.filter(row=>!row.executed).map(row=>Number(row.discovery_round || 1));
+  const nextRound = pendingRounds.length ? Math.min(...pendingRounds) : Math.max(Number(checkpoint.discovery_round || 1),...plan.map(row=>Number(row.discovery_round || 1))) + 1;
+  let added = 0;
+  for (const source of incoming) {
+    const key = keywordSignature(source.query);
+    if (!key || used.has(key)) continue;
+    used.add(key); added += 1;
+    plan.push({...source,discovery_round:nextRound,executed:false,videos_found:0,marginal_yield:0});
   }
-  const rows = plan.filter(row => Number(row.discovery_round || 1) === round && row.executed);
-  if (!rows.length || plan.some(row => Number(row.discovery_round || 1) === round && !row.executed)) return 0;
-  rows.forEach(row => { row.executed = false; row.resume_replay = true; });
-  checkpoint.resume_replayed_queries = true;
-  return rows.length;
+  if (added) checkpoint.discovery_round = Math.min(Number(checkpoint.discovery_round || nextRound),nextRound);
+  return added;
 }
 
 function shouldCircuitBreak(state) { return BLOCKED.has(state); }
@@ -214,11 +299,11 @@ async function runPreflight(probes) {
 
 function deriveEvidenceQueries(comments, round, existing = [], conversationMap = {}) {
   const used = new Set((existing || []).map(x => String(x.query || x).toLowerCase())), out = [];
-  const anchors = unique((conversationMap.products || []).flatMap(product => {
+  const anchors = unique([...(conversationMap.direct_terms || []),...(conversationMap.category_terms || []),...(conversationMap.products || []).flatMap(product => {
     const brand = String(product.brand || '').trim();
     const brandWords = brand.split(/\s+/).filter(word => word.length >= 5);
-    return [brand, brandWords.slice(-2).join(' '), ...brandWords.slice(-1)];
-  }).filter(Boolean)).sort((a,b) => b.length-a.length);
+    return [brand,product.product_name,product.category,...(product.common_product_names || []),brandWords.slice(-2).join(' '), ...brandWords.slice(-1)];
+  })].filter(Boolean)).sort((a,b) => b.length-a.length);
   const stop = new Set(['the','and','with','this','that','from','have','been','were','your','their','after','before','into','for','my','our','its','product','video','review']);
   for (const row of comments || []) {
     if (row.relevance_tier === 'irrelevant') continue;
@@ -237,6 +322,21 @@ function deriveEvidenceQueries(comments, round, existing = [], conversationMap =
   return out;
 }
 
+function parseViews(values = []) {
+  const text = (Array.isArray(values)?values:[values]).join(' ');
+  const match = text.match(/([\d,.]+)\s*([KMB])?\s*views?/i);
+  if (!match) return 0;
+  const multiplier = {K:1e3,M:1e6,B:1e9}[String(match[2] || '').toUpperCase()] || 1;
+  return Number(match[1].replace(/,/g,'')) * multiplier || 0;
+}
+
+function prioritizeVideos(rows = []) {
+  return [...rows].sort((a,b)=>{
+    const score = row => Math.log10(parseViews(row.search_metadata)+1) * 20 + (row.matched_queries?.length || 1) * 5 - Number(row.search_position || 99) / 10;
+    return score(b)-score(a);
+  });
+}
+
 function evaluateStop({trusted=0,targetComments=Infinity,rounds=[],maxRounds=Infinity,minNew=0,duplicateRateStop=1,inspectedVideos=0,maxVideos=Infinity,accessState,userStopped=false} = {}) {
   if (userStopped) return {stop:true,stop_reason:'user_stopped'};
   if (shouldCircuitBreak(accessState)) return {stop:true,stop_reason:`access_${accessState}`};
@@ -244,9 +344,9 @@ function evaluateStop({trusted=0,targetComments=Infinity,rounds=[],maxRounds=Inf
   if (inspectedVideos >= maxVideos) return {stop:true,stop_reason:'max_videos_reached'};
   if (rounds.length >= maxRounds) return {stop:true,stop_reason:'max_discovery_rounds'};
   const last = rounds.slice(-2);
-  if (last.length === 2 && last.every(x => Number(x.new_trusted || 0) < minNew)) return {stop:true,stop_reason:'low_marginal_yield'};
-  if (last.length === 2 && last.every(x => Number(x.duplicate_rate || 0) >= duplicateRateStop)) return {stop:true,stop_reason:'duplicate_saturation'};
+  if (last.length === 2 && last.every(x => Number(x.new_collected ?? x.new_trusted ?? 0) < minNew)) return {stop:true,stop_reason:'product_query_exhausted'};
+  if (last.length === 2 && last.every(x => Number(x.duplicate_rate || 0) >= duplicateRateStop) && last.every(x=>Number(x.new_collected ?? x.new_trusted ?? 0) === 0)) return {stop:true,stop_reason:'product_query_exhausted'};
   return {stop:false,stop_reason:null};
 }
 
-module.exports = {auditVideo,buildConversationMap,classifyCommentRelevance,cleanKeywordPlan,countTrustedUnique,dedupeVideos,deriveEvidenceQueries,emptyCheckpoint,evaluateStop,flattenCommentTree,isReplyExpansionLabel,isValidComment,loadCheckpoint,mergeComments,migrateCheckpoint,parseAsinInputs,partitionRecords,reconcileVideoAudits,requeueQueriesForResume,runPreflight,saveCheckpoint,scoreVideoRelevance,shouldCircuitBreak,shouldVisitVideo,unique};
+module.exports = {auditVideo,buildConversationMap,buildProductContext,buildProductQueries,classifyCommentRelevance,cleanKeywordPlan,countTrustedUnique,dedupeVideos,deriveEvidenceQueries,emptyCheckpoint,evaluateStop,flattenCommentTree,isReplyExpansionLabel,isValidComment,loadCheckpoint,mergeComments,mergeResumeQueries,migrateCheckpoint,parseAsinInputs,partitionRecords,prioritizeVideos,reconcileVideoAudits,requeueQueriesForResume,runPreflight,saveCheckpoint,scoreVideoRelevance,shouldCircuitBreak,shouldVisitVideo,unique};

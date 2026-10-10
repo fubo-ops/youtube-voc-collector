@@ -1,85 +1,46 @@
 # YouTube VOC Collector
 
-一套可独立运行、也可作为 Codex Skill 使用的公开 YouTube VOC 评论采集器。输入一个或多个 Amazon US ASIN 后，从 Amazon 商品信息和 SellerSprite 可见关键词生成查询计划，搜索 YouTube 视频并保存公开主评论与可见回复。
-
-## 支持环境
-
-- Windows 10/11、macOS、Linux（独立 Chrome CDP 模式以 Windows 脚本为主）
-- Python 3.10–3.13
-- Node.js 22+
-- Google Chrome
-
-GitHub Actions 在三种操作系统及 Python 最低、最高支持版本上运行 Python、Node 和 Skill 验证。
+通用 Amazon 产品驱动的公开 YouTube 原始评论采集 Skill。输入 Amazon US ASIN 后，程序从商品标题、五点描述与 SellerSprite 可见关键词建立 `product_context`，生成产品名、品类、属性、场景、问题、效果、材料/成分、购买意图和替代品查询族，再采集公开视频中的主评论和可见回复。
 
 ## 安装
 
 ```powershell
 git clone https://github.com/fubo-ops/youtube-voc-collector.git
 cd youtube-voc-collector
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
 npm ci
-```
-
-安装为 Codex Skill：
-
-```powershell
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 powershell -ExecutionPolicy Bypass -File .\doctor.ps1
 ```
 
-## 运行
+需要 Node.js 22+、Python 3.10–3.13 和 Google Chrome。
 
-查看完整参数：
+## 运行
 
 ```powershell
 node scripts\youtube_playwright_collector.cjs --help
-python scripts\normalize_raw_jsonl.py --help
+node scripts\youtube_playwright_collector.cjs preflight --asin B0HMGGX71C --headless 0 --profile-dir .youtube-voc-browser-profile
+node scripts\youtube_playwright_collector.cjs --asin B0HMGGX71C --target-comments 800 --videos-per-query 15 --max-comments-per-video 50 --max-reply-actions 15 --detail-concurrency 3 --headless 0 --profile-dir .youtube-voc-browser-profile
 ```
 
-单 ASIN 示例：
+默认输出到当前工作目录的 `YouTube评论采集/<ASIN>`。`--resume` 会合并新的 `--expanded-keywords`，保留候选池，并跳过已完成查询和视频。
+
+## 采集规则
+
+- 查询由当前产品语义生成，不依赖固定品类词。
+- 视频审核排除跨品类、错误物种、人类用途及无关 ASMR。
+- 所有成功读取的公开评论和回复均进入 `Raw_Comments`；审核和相关性只作附加字段。
+- 仅按稳定评论 ID 技术去重；缺失 ID 时仅按 `video_id + author + comment_text` 完全一致去重。
+- 每条记录均为 comment，独立视频记录始终为 0。
+
+## 输出与验证
+
+输出 JSONL、CSV、Query Plan、manifest、checkpoint、视频证据与 Excel。Excel 包含 `Raw_Comments`、`Query_Plan`、`Video_Audit`、`Run_Summary`、`Quality_Gate`。Quality Gate 只检查字段、URL、父子关系、技术重复、记录类型和输出数量一致性。
 
 ```powershell
-node scripts\youtube_playwright_collector.cjs --asin B003ULL1NQ --target-videos 100 --comments-per-video 20 --headless 0
-```
-
-ASIN 组示例：
-
-```powershell
-node scripts\youtube_playwright_collector.cjs --asins B003ULL1NQ,B000000000 --max-queries all --videos-per-query 15 --comments-per-video 20 --headless 0
-```
-
-默认输出到当前工作目录的 `outputs/youtube`。使用已有登录状态时传入独立的 `--profile-dir`；不要把该目录提交到仓库。
-
-## 输出
-
-- comments-only JSONL 与 CSV
-- Query Plan、manifest、checkpoint 和视频审计证据
-- 原生 Excel，主工作表为 `Raw_Comments`
-- 每条记录均为 `record_type: "comment"`，通过 `source_parent_id = video:<video_id>` 追溯视频
-- 只按稳定 comment ID，或 ID 缺失时的完整一致组合去除技术重复
-
-Excel 生成器优先使用 Codex 随附的 artifact-tool。公共 CI 缺少该私有运行时组件时会跳过 Excel 集成测试，其余采集、标准化和数据契约测试仍完整执行。
-
-## 安全边界
-
-- 只处理公开可见内容和公开可见回复。
-- 不读取、导出或提交 Cookie、密码、Token、浏览器 Profile 或历史记录。
-- 不自动登录、不处理验证码、不绕过登录、年龄、地区、会员或私有视频限制。
-- `.gitignore` 排除 outputs、profile、Excel、JSONL、日志、缓存和环境文件。
-
-详细流程见 `SKILL.md` 与 `references/collection-guide.md`；字段见 `references/raw-record-schema.md`。
-
-## 测试
-
-```powershell
-python -m unittest discover -s tests -v
 npm test
 npm run check
+python -m unittest discover -s tests -v
 python scripts\quick_validate.py .
 ```
 
-## 许可证
-
-MIT，见 `LICENSE`。
+只处理公开可见内容；不读取或导出 Cookie、密码、Token，不自动登录或处理验证码，不绕过访问限制。字段说明见 `references/raw-record-schema.md`。

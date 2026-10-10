@@ -22,9 +22,9 @@ test('legacy Trusted partition remains available only as diagnostic metadata', (
   assert.equal(core.countTrustedUnique(rows), 1);
 });
 
-test('keyword normalization drops naked broad words and near duplicates', () => {
-  const rows = core.cleanKeywordPlan(['Dog','dogs','Joint','Zesty Paws Mobility Bites','zesty paws mobility bite']);
-  assert.deepEqual(rows.map(x => x.cleaned_keyword), ['Zesty Paws Mobility Bites']);
+test('keyword normalization drops naked generic words and near duplicates', () => {
+  const rows = core.cleanKeywordPlan(['Product','products','Review','Acme Slow Feeder Bowl','acme slow feeder bowls']);
+  assert.deepEqual(rows.map(x => x.cleaned_keyword), ['Acme Slow Feeder Bowl']);
 });
 
 test('videos deduplicate globally and merge query and ASIN lineage', () => {
@@ -87,40 +87,87 @@ test('only empty and tombstone placeholders are not capturable comments', () => 
 });
 
 test('product semantics keep distinctive product anchors and dog species', () => {
-  const map = core.buildConversationMap([{asin:'B003ULL1NQ',title:'Nutramax Cosequin Joint Supplement for Dogs, Chewable Tablets',brand:'Nutramax Cosequin',bullets:['With glucosamine for mobility']}]);
-  assert.ok(map.direct_terms.some(term=>/cosequin/i.test(term)));
-  assert.equal(map.direct_terms.some(term=>/^supplement$/i.test(term)),false);
-  assert.equal(map.target_species,'dog');
+  const map = core.buildConversationMap([{asin:'B000000001',title:'AquaPurr Cat Water Fountain',brand:'AquaPurr',bullets:['Quiet filtered drinking water for cats']}]);
+  assert.ok(map.direct_terms.some(term=>/aquapurr/i.test(term)));
+  assert.equal(map.direct_terms.some(term=>/^fountain$/i.test(term)),false);
+  assert.equal(map.target_species,'cat');
+});
+
+test('product semantics switch between lick bowl and joint supplement ASINs', () => {
+  const lick = core.buildProductContext({
+    asin:'B0HMGGX71C',
+    title:'Dog Lick Bowl Slow Feeder',
+    bullets:['Reduces anxiety and boredom during grooming','Use with wet food, peanut butter, or frozen yogurt','Non-slip silicone base'],
+    seller_keywords:['dog lick mat','slow feeder bowl'],
+  });
+  const joint = core.buildProductContext({
+    asin:'B003ULL1NQ',
+    title:'Cosequin Joint Health Supplement for Dogs',
+    bullets:['Glucosamine, chondroitin and MSM support mobility','Chewable tablets for senior dogs'],
+    seller_keywords:['dog joint supplement','canine mobility chews'],
+  });
+  const lickMap = core.buildConversationMap([lick]);
+  const jointMap = core.buildConversationMap([joint]);
+  assert.equal(lickMap.target_species,'dog');
+  assert.equal(jointMap.target_species,'dog');
+  assert.ok(lickMap.semantic_terms.some(term=>/lick bowl/i.test(term)));
+  assert.ok(lickMap.semantic_terms.some(term=>/anxiety|grooming/i.test(term)));
+  assert.equal(lickMap.semantic_terms.some(term=>/glucosamine|joint health/i.test(term)),false);
+  assert.ok(jointMap.semantic_terms.some(term=>/glucosamine|joint health/i.test(term)));
+  assert.equal(jointMap.semantic_terms.some(term=>/lick bowl|peanut butter/i.test(term)),false);
+});
+
+test('generic query families cover product semantics without product-specific templates', () => {
+  const context = core.buildProductContext({
+    asin:'B0HMGGX71C', title:'Dog Lick Bowl Slow Feeder',
+    bullets:['Silicone non-slip bowl for grooming and anxiety relief','Serve wet food and frozen treats'],
+    seller_keywords:['dog enrichment feeder','lick mat alternative'],
+  });
+  const rows = core.buildProductQueries([context]);
+  const families = new Set(rows.map(row=>row.query_family));
+  for (const family of ['product','category','attribute','use_case','problem','effect','component','purchase_intent','alternative']) {
+    assert.ok(families.has(family), family);
+  }
+  assert.ok(rows.every(row => row.query.toLowerCase().includes('lick') || row.query.toLowerCase().includes('dog')));
+});
+
+test('generic relevance rejects wrong species, cross-category drift and unrelated ASMR', () => {
+  const map = core.buildConversationMap([core.buildProductContext({
+    asin:'B0HMGGX71C', title:'Dog Lick Bowl Slow Feeder',
+    bullets:['For anxiety relief and wet food enrichment'], seller_keywords:['dog lick mat'],
+  })]);
+  assert.equal(core.scoreVideoRelevance({title:'Dog lick bowl slow feeder review'},map).relevant,true);
+  assert.equal(core.scoreVideoRelevance({title:'Cat water fountain review'},map).relevant,false);
+  assert.equal(core.scoreVideoRelevance({title:'Human bowl licking ASMR compilation'},map).relevant,false);
 });
 
 test('video relevance does not promote unrelated comments', () => {
-  const map = {direct_terms:['zesty paws'],competitive_terms:['cosequin'],need_terms:['dog limping']};
-  assert.equal(core.scoreVideoRelevance({title:'Zesty Paws review'},map).relevant,true);
+  const map = {direct_terms:['acme feeder'],competitive_terms:['beta feeder'],need_terms:['slow eating']};
+  assert.equal(core.scoreVideoRelevance({title:'Acme Feeder review'},map).relevant,true);
   assert.equal(core.classifyCommentRelevance({body:'great camera work'},map).relevance_tier,'irrelevant');
 });
 
-test('dog product video audit rejects horse and human search drift', () => {
-  const map = {direct_terms:['nutramax cosequin','cosequin'],competitive_terms:[],need_terms:['dog mobility'],target_species:'dog'};
-  assert.equal(core.scoreVideoRelevance({title:'Nutramax Cosequin for Dogs mobility review'},map).relevant,true);
-  assert.equal(core.scoreVideoRelevance({title:'Cosequin ASU horse joint supplement review'},map).relevant,false);
-  assert.equal(core.scoreVideoRelevance({title:'Best human joint supplements for seniors'},map).relevant,false);
-  assert.equal(core.scoreVideoRelevance({title:'Top 5 supplements for joint pain'},map).relevant,false);
+test('animal product video audit rejects wrong species and human-use drift', () => {
+  const map = {direct_terms:['aquapurr fountain'],category_terms:['cat water fountain'],competitive_terms:[],need_terms:['quiet drinking water'],target_species:'cat'};
+  assert.equal(core.scoreVideoRelevance({title:'AquaPurr cat water fountain review'},map).relevant,true);
+  assert.equal(core.scoreVideoRelevance({title:'Horse automatic water feeder review'},map).relevant,false);
+  assert.equal(core.scoreVideoRelevance({title:'Human desktop drinking fountain'},map).relevant,false);
 });
 
 test('semantic tiers are explainable', () => {
-  const map = {direct_terms:['zesty paws'],competitive_terms:['cosequin'],need_terms:['dog limping']};
-  assert.equal(core.classifyCommentRelevance({body:'Zesty Paws helped'},map).relevance_tier,'direct_product');
-  assert.equal(core.classifyCommentRelevance({body:'Cosequin was cheaper'},map).relevance_tier,'competitive_context');
-  const need = core.classifyCommentRelevance({body:'My dog limping after walks'},map);
+  const map = {direct_terms:['acme feeder'],competitive_terms:['beta feeder'],need_terms:['slow eating']};
+  assert.equal(core.classifyCommentRelevance({body:'Acme Feeder helped'},map).relevance_tier,'direct_product');
+  assert.equal(core.classifyCommentRelevance({body:'Beta Feeder was cheaper'},map).relevance_tier,'competitive_context');
+  const need = core.classifyCommentRelevance({body:'Slow eating solved the mess'},map);
   assert.equal(need.relevance_tier,'unmet_need');
   assert.ok(need.semantic_link && need.evidence_reason && need.confidence > 0);
 });
 
-test('dog joint unmet needs require dog context and reject human-only problems', () => {
-  const map = {direct_terms:['cosequin'],competitive_terms:['dasuquin'],need_terms:['arthritis','limping','stiffness','stairs','acl'],target_species:'dog'};
-  assert.equal(core.classifyCommentRelevance({body:'My senior dog is limping and stiff on the stairs'},map).relevance_tier,'unmet_need');
-  assert.equal(core.classifyCommentRelevance({body:'My hip arthritis improved with exercise'},map).relevance_tier,'irrelevant');
-  assert.equal(core.classifyCommentRelevance({body:'Dasuquin worked better for my dog'},map).relevance_tier,'competitive_context');
+test('species-aware unmet needs require the current product species', () => {
+  const map = {direct_terms:['aquapurr'],competitive_terms:['beta fountain'],need_terms:['quiet drinking water'],target_species:'cat'};
+  assert.equal(core.classifyCommentRelevance({body:'My cat finally has quiet drinking water'},map).relevance_tier,'unmet_need');
+  assert.equal(core.classifyCommentRelevance({body:'People need quiet drinking water'},map).relevance_tier,'irrelevant');
+  assert.equal(core.classifyCommentRelevance({body:'Beta fountain worked better for my cat'},map).relevance_tier,'competitive_context');
 });
 
 test('PASS, PARTIAL and BLOCKED partitioning keeps only PASS as Trusted', () => {
@@ -150,21 +197,27 @@ test('checkpoint migrates, resumes PASS skips and retries PARTIAL', () => {
   assert.equal(core.shouldVisitVideo(cp,'v2',{forceReauditPartial:true, queryAlreadyDone:true}),true);
 });
 
-test('legacy checkpoint requeues completed discovery queries when target is incomplete', () => {
+test('resume merges only new expanded keywords and never replays completed queries', () => {
   const cp = core.migrateCheckpoint({trusted_comment_count:2,discovery_round:1,query_plan:[
     {query:'q1',discovery_round:1,executed:true},{query:'q2',discovery_round:1,executed:true},
   ]});
-  assert.equal(core.requeueQueriesForResume(cp,20),2);
-  assert.deepEqual(cp.query_plan.map(row=>row.executed),[false,false]);
-  assert.equal(core.requeueQueriesForResume(cp,2),0);
-  const rawComplete = core.migrateCheckpoint({final_collected_count:20,trusted_comment_count:0,query_plan:[{query:'q',executed:true}]});
-  assert.equal(core.requeueQueriesForResume(rawComplete,20),0);
-  const advanced = core.migrateCheckpoint({trusted_comment_count:0,discovery_round:2,query_plan:[
-    {query:'seed',discovery_round:1,executed:true},
-  ]});
-  assert.equal(core.requeueQueriesForResume(advanced,20),1);
-  assert.equal(advanced.discovery_round,1);
-  assert.equal(advanced.query_plan[0].executed,false);
+  const added = core.mergeResumeQueries(cp,[
+    {query:'q2',asins:['B0HMGGX71C']},
+    {query:'dog lick bowl frozen treats',asins:['B0HMGGX71C']},
+  ]);
+  assert.equal(added,1);
+  assert.deepEqual(cp.query_plan.slice(0,2).map(row=>row.executed),[true,true]);
+  assert.equal(cp.query_plan.at(-1).executed,false);
+  assert.equal(cp.query_plan.at(-1).discovery_round,2);
+  assert.equal(core.requeueQueriesForResume(cp,20),0);
+});
+
+test('resume skips completed videos and preserves candidate pool', () => {
+  const cp = core.migrateCheckpoint({candidate_pool:[{video_id:'new'}],video_audits:{done:'PASS',blocked:'BLOCKED'}});
+  assert.equal(cp.candidate_pool.length,1);
+  assert.equal(core.shouldVisitVideo(cp,'done'),false);
+  assert.equal(core.shouldVisitVideo(cp,'blocked'),false);
+  assert.equal(core.shouldVisitVideo(cp,'new'),true);
 });
 
 test('checkpoint atomic save/load preserves state', () => {
@@ -190,10 +243,10 @@ test('preflight never invokes formal comment collection', async () => {
 });
 
 test('evidence-derived queries keep source ids and discovery round', () => {
-  const map = {products:[{brand:'Zesty Paws Mobility Bites'}],direct_terms:['zesty paws mobility bites','mobility bites']};
-  const rows = core.deriveEvidenceQueries([{video_id:'v1',comment_id:'c1',body:'Mobility Bites took three weeks to work for my senior dog',relevance_tier:'direct_product',matched_asins:['A']}],2,[],map);
+  const map = {products:[{brand:'Acme Feeder'}],direct_terms:['acme feeder']};
+  const rows = core.deriveEvidenceQueries([{video_id:'v1',comment_id:'c1',body:'Acme Feeder took three weeks to help with slow eating',relevance_tier:'direct_product',matched_asins:['A']}],2,[],map);
   assert.ok(rows.length);
-  assert.match(rows[0].query,/mobility bites/i);
+  assert.match(rows[0].query,/acme feeder/i);
   assert.equal(rows[0].generation_source,'youtube_comment');
   assert.deepEqual(rows[0].source_video_ids,['v1']);
   assert.deepEqual(rows[0].evidence_comment_ids,['c1']);
@@ -201,23 +254,32 @@ test('evidence-derived queries keep source ids and discovery round', () => {
 });
 
 test('evidence query discovery rejects promotional and unanchored drift', () => {
-  const map = {products:[{brand:'Nutramax Cosequin'}],direct_terms:['nutramax cosequin','cosequin']};
+  const map = {products:[{brand:'Acme Feeder'}],direct_terms:['acme feeder']};
   const rows = core.deriveEvidenceQueries([
     {video_id:'v1',comment_id:'c1',body:'link to the product featured in this video',relevance_tier:'direct_product'},
     {video_id:'v2',comment_id:'c2',body:'check out the full review https://example.com',relevance_tier:'direct_product'},
-    {video_id:'v3',comment_id:'c3',body:'Nutramax Dasuquin with MSM chewables review',relevance_tier:'direct_product'},
-    {video_id:'v4',comment_id:'c4',body:'Cosequin helped my senior dog climb stairs after three weeks',relevance_tier:'direct_product'},
+    {video_id:'v3',comment_id:'c3',body:'Unrelated Brand product review',relevance_tier:'direct_product'},
+    {video_id:'v4',comment_id:'c4',body:'Acme Feeder helped slow eating after three weeks',relevance_tier:'direct_product'},
   ],2,[],map);
   assert.equal(rows.length,1);
-  assert.match(rows[0].query,/cosequin/i);
+  assert.match(rows[0].query,/acme feeder/i);
   assert.doesNotMatch(rows[0].query,/https|check out|link to/i);
 });
 
-test('stop conditions include target, low yield, duplicates and max videos', () => {
+test('stop conditions require consecutive empty product rounds before exhaustion', () => {
   assert.equal(core.evaluateStop({trusted:20,targetComments:20}).stop_reason,'target_comments_reached');
-  assert.equal(core.evaluateStop({trusted:1,targetComments:20,rounds:[{new_trusted:1},{new_trusted:0}],minNew:2}).stop_reason,'low_marginal_yield');
-  assert.equal(core.evaluateStop({trusted:1,targetComments:20,rounds:[{duplicate_rate:.9},{duplicate_rate:.95}],duplicateRateStop:.8}).stop_reason,'duplicate_saturation');
+  assert.equal(core.evaluateStop({trusted:1,targetComments:20,rounds:[{new_collected:0}],minNew:2}).stop,false);
+  assert.equal(core.evaluateStop({trusted:1,targetComments:20,rounds:[{new_collected:0},{new_collected:0}],minNew:2}).stop_reason,'product_query_exhausted');
+  assert.equal(core.evaluateStop({trusted:1,targetComments:20,rounds:[{new_collected:0,duplicate_rate:.9},{new_collected:0,duplicate_rate:.95}],duplicateRateStop:.8}).stop_reason,'product_query_exhausted');
   assert.equal(core.evaluateStop({trusted:1,targetComments:20,inspectedVideos:10,maxVideos:10}).stop_reason,'max_videos_reached');
+});
+
+test('new candidate priority favors likely-comment-rich relevant videos', () => {
+  const rows = core.prioritizeVideos([
+    {video_id:'short',search_position:1,title:'Dog lick bowl review',search_metadata:['12 views']},
+    {video_id:'popular',search_position:4,title:'Dog lick bowl review and tutorial',search_metadata:['120K views']},
+  ]);
+  assert.equal(rows[0].video_id,'popular');
 });
 
 test('audit tiers use frontier and access status', () => {

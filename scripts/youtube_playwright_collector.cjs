@@ -17,7 +17,7 @@ const DEFAULT_VIDEOS_PER_QUERY = 15;
 const DEFAULT_DETAIL_CONCURRENCY = 1;
 const DEFAULT_TARGET_COMMENTS = 100;
 const DEFAULT_BROWSER_CHANNEL = "chrome";
-const DEFAULT_OUT_DIR = path.resolve(process.cwd(), "outputs/youtube");
+const DEFAULT_OUT_ROOT = path.resolve(process.cwd(), "YouTube评论采集");
 const ASIN_RE = /^[A-Z0-9]{10}$/;
 const SELLERSPRITE_REVERSE_URL = "https://www.sellersprite.com/v3/keyword-reverse/";
 
@@ -56,7 +56,7 @@ Optional:
   --channel chrome
   --channel chromium
   --executable-path "/path/to/chromium"
-  --out-dir outputs/youtube
+  --out-dir PATH  (default: ./YouTube评论采集/ASIN)
   --profile-dir .youtube-voc-browser-profile
 `;
 
@@ -209,8 +209,8 @@ function cleanPhrase(value, maxWords = 14) {
 }
 
 const BROAD_SINGLE_TERMS = new Set([
-  "dog", "dogs", "joint", "joints", "pet", "pets", "health", "support", "care",
-  "large", "small", "soft", "food", "supplement", "supplements", "chew", "chews",
+  "product", "products", "item", "items", "review", "reviews", "best", "buy",
+  "large", "small", "soft", "health", "support", "care",
 ]);
 const PHRASE_STOP_WORDS = new Set([
   "a", "an", "and", "are", "as", "at", "be", "been", "by", "for", "from", "has",
@@ -325,35 +325,10 @@ function selectSellerKeywords(text, excluded = [], limit = 30) {
 }
 
 function deriveExpansionCandidates(context) {
-  const title = context.title || context.amazon_keywords?.[0] || context.asin;
-  const anchor = productAnchor(title) || context.asin;
-  const text = `${title} ${(context.bullets || []).join(" ")}`.toLowerCase();
-  const phrases = [
-    ["review", "review"], ["customer reviews", "review"], ["veterinarian review", "review"],
-    ["benefits", "effect"], ["ingredients explained", "ingredient"], ["effectiveness", "effect"],
-    ["results", "effect"], ["before and after", "effect"], ["how long to work", "effect"],
-    ["dosage", "dosage"], ["dosage by weight", "dosage"], ["daily dosage", "dosage"],
-    ["how to use", "usage"], ["daily use", "usage"], ["long term use", "usage"],
-    ["side effects", "safety"], ["safety", "safety"], ["adverse reactions", "safety"],
-    ["worth it", "purchase_intent"], ["price", "purchase_intent"], ["where to buy", "purchase_intent"],
-    ["Amazon review", "purchase_intent"], ["pros and cons", "purchase_intent"], ["vs alternatives", "purchase_intent"],
-  ];
-  if (/\bdogs?\b/.test(text)) phrases.push(
-    ["for senior dogs", "use_case"], ["for large breed dogs", "use_case"], ["for small breed dogs", "use_case"],
-    ["dog mobility support", "problem"], ["stiff joints in dogs", "problem"], ["arthritis support for dogs", "problem"],
-    ["how much to give dogs", "dosage"],
-  );
-  if (/joint|mobility|hip/.test(text)) phrases.push(
-    ["joint health benefits", "effect"], ["hip and joint mobility", "use_case"], ["joint pain support", "problem"],
-  );
-  for (const ingredient of ["glucosamine", "chondroitin", "msm", "methylsulfonylmethane"]) {
-    if (text.includes(ingredient)) phrases.push([`${ingredient} benefits`, "ingredient"], [`${ingredient} review`, "ingredient"]);
-  }
-  if (/chewable|tablet|chew/.test(text)) phrases.push(["chewable tablets review", "format"], ["how to give chewable tablets", "usage"]);
-  return phrases.map(([phrase, dimension]) => ({
-    raw_keyword: `${anchor} ${phrase}`,
-    source: `derived:${dimension}`,
-    asins: [context.asin],
+  return vocCore.buildProductQueries([context]).map(row => ({
+    raw_keyword: row.query,
+    source: `derived:${row.query_family}`,
+    asins: row.asins,
   }));
 }
 
@@ -379,7 +354,7 @@ function buildKeywordPlan(args, productContexts = []) {
   const requestedLimit = String(args["max-queries"] || "12").toLowerCase();
   const numericLimit = requestedLimit === "all" ? null : Math.max(0, Number(requestedLimit));
   let cleaned = cleanKeywordCandidates(rows);
-  if (numericLimit !== null && cleaned.length < numericLimit) {
+  if (numericLimit === null || cleaned.length < numericLimit) {
     const expansionQueues = productContexts.map(deriveExpansionCandidates);
     const maxDepth = Math.max(0, ...expansionQueues.map((queue) => queue.length));
     outer: for (let index = 0; index < maxDepth; index += 1) {
@@ -387,7 +362,7 @@ function buildKeywordPlan(args, productContexts = []) {
         if (!queue[index]) continue;
         rows.push(queue[index]);
         cleaned = cleanKeywordCandidates(rows);
-        if (cleaned.length >= numericLimit) break outer;
+        if (numericLimit !== null && cleaned.length >= numericLimit) break outer;
       }
     }
   }
@@ -612,7 +587,7 @@ async function countVisibleCommentNodes(page) {
   return page.locator("ytd-comment-thread-renderer #content-text").count();
 }
 
-async function expandReplyControls(page, maxActions = 40, onAction = async () => {}) {
+async function expandReplyControls(page, maxActions = 40, onAction = async () => {}, maxComments = Infinity) {
   const ledger = [];
   for (let action = 0; action < maxActions; action += 1) {
     const controls = page.locator("ytd-comment-replies-renderer #more-replies, ytd-comment-replies-renderer #continuation button, ytd-comment-thread-renderer #more-replies, ytd-comment-replies-renderer button");
@@ -626,6 +601,7 @@ async function expandReplyControls(page, maxActions = 40, onAction = async () =>
         const id = await control.getAttribute("id").catch(()=>"");
         if (!/more-replies|continuation/.test(id || "") && !vocCore.isReplyExpansionLabel(label)) continue;
         const before = await countVisibleCommentNodes(page);
+        if (before >= maxComments) return ledger;
         const controlKey = `${index}:${label}`;
         await control.click({ timeout: 1800 });
         await page.waitForTimeout(700);
@@ -661,7 +637,7 @@ async function collectVideoDetail(page, candidate, commentsPerVideo, options = {
   await expandDescription(page);
   await autoScroll(page, 2);
   const loadState = await loadCommentsUntil(page, commentsPerVideo);
-  const actionLedger = await expandReplyControls(page, Number(options.maxReplyActions || 40), options.onReplyAction);
+  const actionLedger = await expandReplyControls(page, Number(options.maxReplyActions || 40), options.onReplyAction, commentsPerVideo);
 
   const detail = await page.evaluate((maxComments) => {
     const textOf = (selector) => {
@@ -899,7 +875,7 @@ function recordsToCsv(records) {
   return `${lines.join("\n")}\n`;
 }
 
-function qualityGate(records, targetVideos) {
+function qualityGate(records, targetVideos, outputCounts = {}) {
   const seen = new Set();
   const videoParents = new Set();
   const commentIds = new Set(records.map(record => record.comment_id).filter(Boolean));
@@ -938,7 +914,9 @@ function qualityGate(records, targetVideos) {
     } else unexpectedRecordTypeCount += 1;
   }
   const videoCount = videoParents.size;
-  const hasIntegrityIssues = missingId + missingParentId + missingUrl + missingText + duplicateCount + orphanReplyCount + malformedUrl + unexpectedRecordTypeCount > 0;
+  const counts = [outputCounts.jsonl ?? records.length,outputCounts.csv ?? records.length,outputCounts.excel ?? records.length];
+  const outputCountMismatch = counts.filter(count=>Number(count)!==records.length).length;
+  const hasIntegrityIssues = missingId + missingParentId + missingUrl + missingText + duplicateCount + orphanReplyCount + malformedUrl + unexpectedRecordTypeCount + outputCountMismatch > 0;
   const decision = records.length === 0 ? "fail" : !hasIntegrityIssues ? "pass" : "warning";
   return {
     gate: "acquisition_quality_gate",
@@ -962,6 +940,10 @@ function qualityGate(records, targetVideos) {
       duplicate_id_count: duplicateCount,
       malformed_url_count: malformedUrl,
       unexpected_record_type_count: unexpectedRecordTypeCount,
+      jsonl_count: counts[0],
+      csv_count: counts[1],
+      excel_raw_comments_count: counts[2],
+      output_count_mismatch_count: outputCountMismatch,
     },
   };
 }
@@ -991,7 +973,10 @@ async function runPreflightCommand(parsedArgs) {
   const chromium = loadPlaywrightChromium();
   const profileDir = path.resolve(process.cwd(), args["profile-dir"] || ".youtube-voc-browser-profile");
   await fs.mkdir(profileDir,{recursive:true});
-  const browser = await chromium.launchPersistentContext(profileDir,{headless:String(args.headless ?? "1") !== "0",channel:args.channel || DEFAULT_BROWSER_CHANNEL,locale:"en-US",viewport:{width:1360,height:900}});
+  const profileLock = await acquireProfileLock(profileDir);
+  let browser;
+  try { browser = await chromium.launchPersistentContext(profileDir,{headless:String(args.headless ?? "1") !== "0",channel:args.channel || DEFAULT_BROWSER_CHANNEL,locale:"en-US",viewport:{width:1360,height:900}}); }
+  catch(error){ await profileLock.release(); throw error; }
   const page = await browser.newPage(); page.setDefaultTimeout(15000);
   const visit = async (url) => { try { await page.goto(url,{waitUntil:"domcontentloaded",timeout:30000}); return classifyAccessPage((await page.locator("body").innerText()).slice(0,60000)); } catch (error) { return classifyVideoError(error) === "load_timeout" ? "unavailable" : "access_denied"; } };
   try {
@@ -1005,7 +990,7 @@ async function runPreflightCommand(parsedArgs) {
     const comments = video !== "ready" ? video : (await page.locator("ytd-comments, ytd-comment-thread-renderer").count()) ? "ready" : classifyAccessPage((await page.locator("body").innerText()).slice(0,60000)) === "ready" ? "comments_unavailable" : classifyAccessPage((await page.locator("body").innerText()).slice(0,60000));
     const result = {mode:"preflight",amazon,seller,youtube,video,comments,ready:[amazon,youtube,video,comments].every(x=>x==="ready"),formal_collection_started:false};
     console.log(JSON.stringify(result,null,2)); return result;
-  } finally { await browser.close(); }
+  } finally { await browser.close(); await profileLock.release(); }
 }
 
 async function main() {
@@ -1022,7 +1007,7 @@ async function main() {
   const minNew = Math.max(0, Number(args["min-new-comments-per-round"] || 5));
   const duplicateRateStop = Math.min(1, Math.max(0, Number(args["duplicate-rate-stop"] || .85)));
   const maxFailures = Math.max(1, Number(args["max-failures"] || 5));
-  const outDir = path.resolve(process.cwd(), args["out-dir"] || DEFAULT_OUT_DIR);
+  const outDir = args["out-dir"] ? path.resolve(process.cwd(),args["out-dir"]) : path.join(DEFAULT_OUT_ROOT,args.asins.join("_"));
   const profileDir = path.resolve(process.cwd(), args["profile-dir"] || ".youtube-voc-browser-profile");
   const collectedAt = nowIso(), date = collectedAt.slice(0,10), topicSlug = slugify(args.asins.join("_"));
   const prefix = `${date}_${topicSlug}_youtube`;
@@ -1034,22 +1019,42 @@ async function main() {
     checkpoint:path.join(outDir,`${prefix}_checkpoint.json`), excel:path.join(outDir,`${args.asins.join("_")}_${collectedAt.replace(/[:.]/g,"-")}_youtube_voc.xlsx`),
     evidence:path.join(outDir,"evidence"),
   };
+  if (args.resume) {
+    const resumeCheckpoint = path.resolve(args.resume);
+    const resumeDir = path.dirname(resumeCheckpoint);
+    const resumePrefix = path.basename(resumeCheckpoint).replace(/_checkpoint\.json$/i, "");
+    Object.assign(paths, {
+      raw:path.join(resumeDir,`${resumePrefix}_raw_comments.jsonl`),
+      csv:path.join(resumeDir,`${resumePrefix}_comments_raw.csv`),
+      keywords:path.join(resumeDir,`${resumePrefix}_asin_keywords.json`),
+      conversation:path.join(resumeDir,`${resumePrefix}_conversation_map.json`),
+      query:path.join(resumeDir,`${resumePrefix}_query_plan.json`),
+      channelMap:path.join(resumeDir,`${resumePrefix}_community_or_channel_map.json`),
+      manifest:path.join(resumeDir,`${resumePrefix}_manifest.json`),
+      checkpoint:resumeCheckpoint,
+      evidence:path.join(resumeDir,"evidence"),
+      excel:path.join(resumeDir,`${args.asins.join("_")}_${collectedAt.replace(/[:.]/g,"-")}_youtube_voc.xlsx`),
+    });
+  }
+  const chromium = loadPlaywrightChromium();
+  const launchOptions = {headless:String(args.headless ?? "1") !== "0" && String(args["headed-login"] ?? "0") !== "1",viewport:{width:1360,height:900},locale:"en-US",args:["--window-position=40,40","--window-size=1360,900","--disable-blink-features=AutomationControlled"]};
+  if (args["executable-path"]) launchOptions.executablePath = await ensureChromiumExecutable(chromium,args["executable-path"]); else launchOptions.channel = args.channel || DEFAULT_BROWSER_CHANNEL;
   await fs.mkdir(paths.evidence,{recursive:true}); await fs.mkdir(profileDir,{recursive:true});
+  const profileLock = await acquireProfileLock(profileDir);
   let checkpoint = args.resume ? vocCore.loadCheckpoint(path.resolve(args.resume)) : vocCore.emptyCheckpoint();
   checkpoint.input_asins = args.asins;
   const existingRaw = args.resume && await fileExists(paths.raw) ? await readJsonl(paths.raw) : [];
   const existingManifest = args.resume && await fileExists(paths.manifest) ? JSON.parse(await fs.readFile(paths.manifest,"utf8")) : {};
   let allComments = vocCore.mergeComments(existingRaw);
 
-  const chromium = loadPlaywrightChromium();
-  const launchOptions = {headless:String(args.headless ?? "1") !== "0" && String(args["headed-login"] ?? "0") !== "1",viewport:{width:1360,height:900},locale:"en-US",args:["--window-position=40,40","--window-size=1360,900","--disable-blink-features=AutomationControlled"]};
-  if (args["executable-path"]) launchOptions.executablePath = await ensureChromiumExecutable(chromium,args["executable-path"]); else launchOptions.channel = args.channel || DEFAULT_BROWSER_CHANNEL;
-  const browser = await chromium.launchPersistentContext(profileDir,launchOptions);
+  let browser;
+  try { browser = await chromium.launchPersistentContext(profileDir,launchOptions); }
+  catch(error){ await profileLock.release(); throw error; }
   const searchPage = await browser.newPage(); searchPage.setDefaultTimeout(20000);
   const detailPages = await Promise.all(Array.from({length:detailConcurrency},async()=>{const p=await browser.newPage();p.setDefaultTimeout(Number(args["video-timeout"] || 60000));return p;}));
   let productContexts = checkpoint.product_contexts || [], keywordPlan, conversationMap, queryPlan = checkpoint.query_plan || [];
-  let allCandidates = [], videoAudits = existingManifest.video_audits || [], rounds = existingManifest.rounds || [], failures = 0;
-  let rawCommentCount = existingManifest.raw_captured_count || existingManifest.raw_comment_count || allComments.length, filteredCount = existingManifest.filtered_count || checkpoint.filtered_count || 0;
+  let allCandidates = checkpoint.candidate_pool || [], videoAudits = existingManifest.video_audits || [], rounds = existingManifest.rounds || [], failures = 0;
+  let rawCommentCount = checkpoint.raw_captured_count || existingManifest.raw_captured_count || existingManifest.raw_comment_count || allComments.length, filteredCount = existingManifest.filtered_count || checkpoint.filtered_count || 0;
   let duplicateCount = checkpoint.duplicate_comment_count || 0, duplicateVideoCount = checkpoint.duplicate_video_count || 0, stop = {stop:false,stop_reason:null};
   try {
     if (!productContexts.length) {
@@ -1059,7 +1064,7 @@ async function main() {
         try { amazon = {...await collectAmazonKeywords(searchPage,asin,Number(args["amazon-term-limit"] || 8)),status:"available",amazon_login_status:"not_required"}; }
         catch (error) { amazon={asin,url:`https://www.amazon.com/dp/${asin}`,title:null,bullets:[],amazon_keywords:[asin],status:classifyAccessPage(error.message),amazon_login_status:"unknown",note:error.message}; }
         const seller = await collectSellerKeywords(sellerPage,asin,amazon.amazon_keywords,Number(args["seller-term-limit"] || 30));
-        productContexts.push({...amazon,product_title:amazon.title,brand:productAnchor(amazon.title),category:null,common_product_names:amazon.title?[amazon.title]:[],core_attributes:amazon.bullets,primary_functions:[],ingredients_or_components:[],use_cases:[],user_problems:[],pain_points:[],competing_products:[],seller_url:seller.url,seller_status:seller.status,seller_note:seller.note || null,seller_keywords:seller.keywords});
+        productContexts.push(vocCore.buildProductContext({...amazon,product_title:amazon.title,common_product_names:amazon.title?[amazon.title]:[],core_attributes:amazon.bullets,seller_url:seller.url,seller_status:seller.status,seller_note:seller.note || null,seller_keywords:seller.keywords}));
       }
       await sellerPage.close(); checkpoint.product_contexts = productContexts; vocCore.saveCheckpoint(paths.checkpoint,checkpoint);
     }
@@ -1067,29 +1072,39 @@ async function main() {
     conversationMap = vocCore.buildConversationMap(productContexts);
     await fs.writeFile(paths.keywords,JSON.stringify({asins:args.asins,product_contexts:productContexts,...keywordPlan},null,2),"utf8");
     await fs.writeFile(paths.conversation,JSON.stringify(conversationMap,null,2),"utf8");
-    if (!queryPlan.length) queryPlan = planQuerySearches(keywordPlan.queries,videosPerQuery).map(row=>({...row,query_family:row.dimension,generation_source:row.keyword_sources?.includes("manual")?"user_expanded_keyword":row.dimension,source_video_ids:[],evidence_comment_ids:[],matched_asins:row.asins,semantic_link:"product-source seed",discovery_round:1,priority:100,executed:false,videos_found:0,trusted_comments_found:0,marginal_yield:0}));
-    if (args.resume) vocCore.requeueQueriesForResume(checkpoint,targetComments);
+    const freshPlan = planQuerySearches(keywordPlan.queries,videosPerQuery).map(row=>({...row,query_family:row.dimension,generation_source:row.keyword_sources?.includes("manual")?"user_expanded_keyword":row.dimension,source_video_ids:[],evidence_comment_ids:[],matched_asins:row.asins,semantic_link:"product-source seed",discovery_round:1,priority:100,executed:false,videos_found:0,trusted_comments_found:0,marginal_yield:0}));
+    if (!queryPlan.length) queryPlan = freshPlan;
+    else if (args.resume) vocCore.mergeResumeQueries(checkpoint,freshPlan);
+    queryPlan = checkpoint.query_plan = queryPlan.length ? queryPlan : freshPlan;
 
-    for (let round = Math.max(1,checkpoint.discovery_round || 1); round <= maxRounds; round += 1) {
+    const startRound = Math.max(1,checkpoint.discovery_round || 1);
+    const roundCeiling = startRound + maxRounds - 1;
+    const roundCountLimit = rounds.length + maxRounds;
+    for (let round = startRound; round <= roundCeiling; round += 1) {
       const roundQueries = queryPlan.filter(row => row.discovery_round === round && !row.executed);
-      if (!roundQueries.length) { stop={stop:true,stop_reason:"semantic_saturation"}; break; }
+      if (!roundQueries.length) {
+        rounds.push({round,new_collected:0,new_raw:0,duplicate_rate:0,queries_executed:0,new_videos:0});
+        stop=vocCore.evaluateStop({trusted:allComments.length,targetComments,rounds,maxRounds:roundCountLimit,minNew,duplicateRateStop,inspectedVideos:Object.keys(checkpoint.video_audits).length,maxVideos:targetVideos});
+        checkpoint.discovery_round=round+1;checkpoint.query_plan=queryPlan;checkpoint.stop_reason=stop.stop_reason;vocCore.saveCheckpoint(paths.checkpoint,checkpoint);
+        if(stop.stop) break;
+        continue;
+      }
       const beforeCollected = allComments.length, beforeRaw = rawCommentCount;
-      const batches = [];
       for (const query of roundQueries) {
         try {
           await randomDelay(Number(args["navigation-delay-min"] || 600),Number(args["navigation-delay-max"] || 1200),searchPage);
           const rows = await collectSearchCandidates(searchPage,{...query,search_url:query.search_url || searchUrl(query.query)},videosPerQuery);
-          query.executed=true;query.videos_found=rows.length;batches.push(rows.map(row=>({...row,discovery_round:round,matched_asins:query.matched_asins || query.asins})));
-          checkpoint.searched_queries=unique([...(checkpoint.searched_queries || []),query.query]);checkpoint.query_plan=queryPlan;vocCore.saveCheckpoint(paths.checkpoint,checkpoint);
+          const enriched=rows.map(row=>({...row,discovery_round:round,matched_asins:query.matched_asins || query.asins}));
+          const beforePool=allCandidates.length;allCandidates=vocCore.dedupeVideos([...allCandidates,...enriched]);duplicateVideoCount+=Math.max(0,enriched.length-(allCandidates.length-beforePool));
+          query.executed=true;query.videos_found=rows.length;
+          checkpoint.searched_queries=unique([...(checkpoint.searched_queries || []),query.query]);checkpoint.query_plan=queryPlan;checkpoint.candidate_pool=allCandidates;checkpoint.duplicate_video_count=duplicateVideoCount;vocCore.saveCheckpoint(paths.checkpoint,checkpoint);
         } catch (error) {
           failures += 1; query.executed=true;query.error=error.message;vocCore.saveCheckpoint(paths.checkpoint,checkpoint);
           const access = classifyAccessPage(error.message); if (vocCore.shouldCircuitBreak(access) || failures >= maxFailures) { stop={stop:true,stop_reason:vocCore.shouldCircuitBreak(access)?`access_${access}`:"max_failures"}; break; }
         }
       }
-      const merged = deduplicateSearchCandidates(batches); duplicateVideoCount += merged.duplicate_video_count;
-      allCandidates = vocCore.dedupeVideos([...allCandidates,...merged.candidates]);
       const remainingSlots = Math.max(0,targetVideos - Object.keys(checkpoint.video_audits || {}).length);
-      const visit = allCandidates.filter(candidate=>vocCore.shouldVisitVideo(checkpoint,candidate.video_id,{retryPartial:Boolean(args["retry-partial"]),forceReauditPartial:Boolean(args["force-reaudit-partial"])})).slice(0,remainingSlots);
+      const visit = vocCore.prioritizeVideos(allCandidates.filter(candidate=>vocCore.shouldVisitVideo(checkpoint,candidate.video_id,{retryPartial:Boolean(args["retry-partial"]),forceReauditPartial:Boolean(args["force-reaudit-partial"])}))).slice(0,remainingSlots);
       for (let offset=0; offset<visit.length && !stop.stop; offset += detailPages.length) {
         const batch = visit.slice(offset,offset+detailPages.length);
         const results = await Promise.all(batch.map(async(candidate,index)=>{
@@ -1115,14 +1130,14 @@ async function main() {
           checkpoint.completed_video_ids=unique(Object.entries(checkpoint.video_audits).filter(([,s])=>s==="PASS").map(([id])=>id));
           checkpoint.partial_video_ids=unique(Object.entries(checkpoint.video_audits).filter(([,s])=>s==="PARTIAL").map(([id])=>id));
           checkpoint.blocked_video_ids=unique(Object.entries(checkpoint.video_audits).filter(([,s])=>s==="BLOCKED").map(([id])=>id));
-          checkpoint.collected_comment_ids=unique(allComments.map(x=>x.comment_id || x.source_item_id));checkpoint.final_collected_count=allComments.length;checkpoint.raw_captured_count=rawCommentCount;checkpoint.technical_duplicate_count=duplicateCount;checkpoint.filtered_count=filteredCount;checkpoint.duplicate_count=duplicateCount;checkpoint.duplicate_comment_count=duplicateCount;checkpoint.duplicate_video_count=duplicateVideoCount;vocCore.saveCheckpoint(paths.checkpoint,checkpoint);
+          checkpoint.collected_comment_ids=unique(allComments.map(x=>x.comment_id || x.source_item_id));checkpoint.final_collected_count=allComments.length;checkpoint.raw_captured_count=rawCommentCount;checkpoint.technical_duplicate_count=duplicateCount;checkpoint.filtered_count=filteredCount;checkpoint.duplicate_count=duplicateCount;checkpoint.duplicate_comment_count=duplicateCount;checkpoint.duplicate_video_count=duplicateVideoCount;checkpoint.candidate_pool=allCandidates;vocCore.saveCheckpoint(paths.checkpoint,checkpoint);await writeFileAtomic(paths.raw,allComments.map(JSON.stringify).join("\n")+(allComments.length?"\n":""));
         }
         if (allComments.length>=targetComments) stop={stop:true,stop_reason:"target_comments_reached"};
       }
       const newCollected=allComments.length-beforeCollected;
       const roundMetric={round,new_collected:newCollected,new_trusted:newCollected,new_raw:rawCommentCount-beforeRaw,duplicate_rate:(rawCommentCount-beforeRaw)>0?Math.max(0,1-newCollected/(rawCommentCount-beforeRaw)):0,queries_executed:roundQueries.length,new_videos:visit.length};rounds.push(roundMetric);
       for(const query of roundQueries){query.collected_comments_found=newCollected;query.marginal_yield=roundQueries.length?newCollected/roundQueries.length:0;}
-      stop=stop.stop?stop:vocCore.evaluateStop({trusted:allComments.length,targetComments,rounds,maxRounds,minNew,duplicateRateStop,inspectedVideos:Object.keys(checkpoint.video_audits).length,maxVideos:targetVideos});
+      stop=stop.stop?stop:vocCore.evaluateStop({trusted:allComments.length,targetComments,rounds,maxRounds:roundCountLimit,minNew,duplicateRateStop,inspectedVideos:Object.keys(checkpoint.video_audits).length,maxVideos:targetVideos});
       if(stop.stop) break;
       const next=vocCore.deriveEvidenceQueries(allComments,round+1,queryPlan,conversationMap).slice(0,Math.max(1,Number(args["max-queries"] === "all" ? 30 : args["max-queries"] || 12))).map(row=>({...row,search_url:searchUrl(row.query),candidate_limit:videosPerQuery,asins:row.matched_asins,keyword_sources:["youtube_evidence"]}));
       queryPlan.push(...next);checkpoint.discovery_round=round+1;checkpoint.query_plan=queryPlan;vocCore.saveCheckpoint(paths.checkpoint,checkpoint);
@@ -1133,17 +1148,23 @@ async function main() {
     await fs.writeFile(paths.csv,recordsToCsv(allComments),"utf8");
     await fs.writeFile(paths.query,JSON.stringify({schema_version:"youtube_query_plan_v2",asins:args.asins,target_comments:targetComments,target_videos:targetVideos,created_at:collectedAt,queries:queryPlan,rounds},null,2),"utf8");
     const channelMap=Object.values(videoAudits.reduce((map,row)=>{const key=row.channel_url || row.channel_title || "unknown";const item=map[key]||{channel_title:row.channel_title,channel_url:row.channel_url,candidate_videos:0,pass_videos:0,trusted_comments:0};item.candidate_videos+=1;item.pass_videos+=row.audit_status==="PASS"?1:0;map[key]=item;return map;},{}));await fs.writeFile(paths.channelMap,JSON.stringify(channelMap,null,2),"utf8");
-    const gate=qualityGate(allComments,targetVideos), statusCounts=Object.fromEntries(["PASS","PARTIAL","BLOCKED"].map(status=>[status,videoAudits.filter(x=>x.audit_status===status).length]));
+    const gate=qualityGate(allComments,targetVideos,{jsonl:allComments.length,csv:allComments.length,excel:allComments.length}), statusCounts=Object.fromEntries(["PASS","PARTIAL","BLOCKED"].map(status=>[status,videoAudits.filter(x=>x.audit_status===status).length]));
     const mainCommentCount=allComments.filter(row=>!row.parent_comment_id).length, replyCount=allComments.length-mainCommentCount;
-    const manifest={schema_version:"youtube_manifest_v3_raw",source:"youtube",collection_layer:"raw",asins:args.asins,input_asin_count:args.asins.length,collected_at:collectedAt,amazon_statuses:productContexts.map(x=>({asin:x.asin,status:x.status})),sellersprite_statuses:productContexts.map(x=>({asin:x.asin,status:x.seller_status,missing_reason:x.seller_note || null})),raw_keyword_count:keywordPlan.raw_keyword_count,effective_keyword_count:keywordPlan.effective_keyword_count,executed_query_count:queryPlan.filter(x=>x.executed).length,search_candidate_count:allCandidates.length+duplicateVideoCount,duplicate_video_count:duplicateVideoCount,deduplicated_video_count:allCandidates.length,video_audit_counts:statusCounts,video_audits:videoAudits,raw_captured_count:rawCommentCount,technical_duplicate_count:duplicateCount,final_collected_count:allComments.length,main_comment_count:mainCommentCount,reply_count:replyCount,filtered_unreadable_count:filteredCount,comments_by_asin:Object.fromEntries(args.asins.map(asin=>[asin,allComments.filter(x=>x.matched_asins?.includes(asin)).length])),rounds,target_comments:targetComments,target_comments_complete:allComments.length>=targetComments,stop_reason:checkpoint.stop_reason,checkpoint_path:paths.checkpoint,video_record_count:0,files:Object.values(paths),quality_checks:[gate],validate_result:gate.decision,comment_count:allComments.length,record_count:allComments.length};
+    const manifest={schema_version:"youtube_manifest_v4_raw",source:"youtube",collection_layer:"raw",asins:args.asins,input_asin_count:args.asins.length,collected_at:collectedAt,amazon_statuses:productContexts.map(x=>({asin:x.asin,status:x.status})),sellersprite_statuses:productContexts.map(x=>({asin:x.asin,status:x.seller_status,missing_reason:x.seller_note || null})),raw_keyword_count:keywordPlan.raw_keyword_count,effective_keyword_count:keywordPlan.effective_keyword_count,executed_query_count:queryPlan.filter(x=>x.executed).length,search_candidate_count:allCandidates.length+duplicateVideoCount,duplicate_video_count:duplicateVideoCount,deduplicated_video_count:allCandidates.length,video_audit_counts:statusCounts,video_audits:videoAudits,raw_captured_count:rawCommentCount,technical_duplicate_count:duplicateCount,final_collected_count:allComments.length,main_comment_count:mainCommentCount,reply_count:replyCount,filtered_unreadable_count:filteredCount,comments_by_asin:Object.fromEntries(args.asins.map(asin=>[asin,allComments.filter(x=>x.matched_asins?.includes(asin)).length])),rounds,target_comments:targetComments,target_comments_complete:allComments.length>=targetComments,stop_reason:checkpoint.stop_reason,checkpoint_path:paths.checkpoint,video_record_count:0,files:Object.values(paths),quality_checks:[gate],validate_result:gate.decision,comment_count:allComments.length,record_count:allComments.length};
     await fs.writeFile(paths.manifest,JSON.stringify(manifest,null,2),"utf8");
     await buildExcelOutput({jsonlPath:paths.raw,queryPlanPath:paths.query,manifestPath:paths.manifest,excelPath:paths.excel});
     console.log(JSON.stringify({raw_captured_count:rawCommentCount,technical_duplicate_count:duplicateCount,final_collected_count:allComments.length,video_records:0,stop_reason:checkpoint.stop_reason,files:paths},null,2));
-  } finally { await Promise.all(detailPages.map(page=>page.close().catch(()=>{}))); await browser.close(); }
+  } finally { await Promise.all(detailPages.map(page=>page.close().catch(()=>{}))); await browser.close(); await profileLock.release(); }
 }
 
 async function fileExists(file){try{await fs.access(file);return true;}catch{return false;}}
 async function readJsonl(file){return (await fs.readFile(file,"utf8")).split(/\r?\n/).filter(Boolean).map(JSON.parse);}
+async function writeFileAtomic(file,data){const temp=`${file}.tmp`;await fs.writeFile(temp,data,"utf8");await fs.rename(temp,file);}
+async function acquireProfileLock(profileDir){
+  const lock=path.join(profileDir,".youtube-voc-collector.lock");
+  try { const handle=await fs.open(lock,"wx"); await handle.writeFile(JSON.stringify({pid:process.pid,created_at:nowIso()})); return {release:async()=>{await handle.close().catch(()=>{});await fs.unlink(lock).catch(()=>{});}}; }
+  catch(error){ if(error.code!=="EEXIST") throw error; throw new Error(`profile-dir is already in use by another youtube-voc-collector: ${profileDir}`); }
+}
 async function randomDelay(min,max,page){const low=Math.max(0,min),high=Math.max(low,max);await page.waitForTimeout(Math.floor(low+Math.random()*(high-low+1)));}
 async function writeEvidence(dir,audit,comments,detail){
   const ids=new Set(comments.map(x=>x.comment_id));const orphans=comments.filter(x=>x.parent_comment_id&&!ids.has(x.parent_comment_id)).map(x=>x.comment_id);

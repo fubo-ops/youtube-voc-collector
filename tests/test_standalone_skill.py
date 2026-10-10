@@ -133,12 +133,12 @@ console.log(JSON.stringify(collector.buildQueries({{'max-queries': '2'}}, contex
         script = f"""
 const collector = require({collector_path});
 const rows = [
-  {{raw_keyword: 'dog', source: 'sellersprite', asin: 'B003ULL1NQ'}},
-  {{raw_keyword: 'dogs', source: 'sellersprite', asin: 'B003ULL1NQ'}},
-  {{raw_keyword: 'joint', source: 'sellersprite', asin: 'B003ULL1NQ'}},
-  {{raw_keyword: 'Nutramax Cosequin Joint Supplement for Dogs, Chewable Tablets, 132ct', source: 'amazon', asin: 'B003ULL1NQ'}},
-  {{raw_keyword: 'Cosequin', source: 'sellersprite', asin: 'B003ULL1NQ'}},
-  {{raw_keyword: 'cosequins', source: 'manual', asin: 'B003ULL1NQ'}}
+  {{raw_keyword: 'product', source: 'sellersprite', asin: 'B0HMGGX71C'}},
+  {{raw_keyword: 'products', source: 'sellersprite', asin: 'B0HMGGX71C'}},
+  {{raw_keyword: 'review', source: 'sellersprite', asin: 'B0HMGGX71C'}},
+  {{raw_keyword: 'Dog Lick Bowl Slow Feeder with Non-Slip Silicone Base', source: 'amazon', asin: 'B0HMGGX71C'}},
+  {{raw_keyword: 'lick bowl', source: 'sellersprite', asin: 'B0HMGGX71C'}},
+  {{raw_keyword: 'lick bowls', source: 'manual', asin: 'B0HMGGX71C'}}
 ];
 console.log(JSON.stringify(collector.cleanKeywordCandidates(rows)));
 """
@@ -149,24 +149,26 @@ console.log(JSON.stringify(collector.cleanKeywordCandidates(rows)));
         self.assertEqual(run.returncode, 0, run.stderr)
         cleaned = json.loads(run.stdout)
         queries = [row["query"].lower() for row in cleaned]
-        self.assertNotIn("dog", queries)
-        self.assertNotIn("dogs", queries)
-        self.assertNotIn("joint", queries)
-        product_query = next(row for row in cleaned if "nutramax" in row["query"].lower())
+        self.assertNotIn("product", queries)
+        self.assertNotIn("products", queries)
+        self.assertNotIn("review", queries)
+        product_query = next(row for row in cleaned if "slow feeder" in row["query"].lower())
         self.assertLessEqual(len(product_query["query"].split()), 8)
-        cosequin = [row for row in cleaned if row["query"].lower() in ("cosequin", "cosequins")]
-        self.assertEqual(len(cosequin), 1)
-        self.assertEqual(set(cosequin[0]["keyword_sources"]), {"sellersprite", "manual"})
-        self.assertEqual(set(cosequin[0]["raw_keywords"]), {"Cosequin", "cosequins"})
+        lick_bowl = [row for row in cleaned if row["query"].lower() in ("lick bowl", "lick bowls")]
+        self.assertEqual(len(lick_bowl), 1)
+        self.assertEqual(set(lick_bowl[0]["keyword_sources"]), {"sellersprite", "manual"})
+        self.assertEqual(set(lick_bowl[0]["raw_keywords"]), {"lick bowl", "lick bowls"})
 
     def test_all_cleaned_queries_are_scheduled_when_limit_is_all(self):
         collector_path = json.dumps(str(COLLECTOR))
         script = f"""
 const collector = require({collector_path});
 const contexts = [{{
-  asin: 'B003ULL1NQ',
-  amazon_keywords: ['Nutramax Cosequin dog joint supplement', 'Cosequin chewable tablets'],
-  seller_keywords: ['cosequin', 'glucosamine', 'arthritis']
+  asin: 'B0HMGGX71C',
+  title: 'Dog Lick Bowl Slow Feeder',
+  bullets: ['Use during grooming with wet food'],
+  amazon_keywords: ['Dog Lick Bowl Slow Feeder', 'Non-slip enrichment bowl'],
+  seller_keywords: ['lick mat', 'slow feeder', 'dog enrichment']
 }}];
 const plan = collector.buildKeywordPlan({{'max-queries': 'all'}}, contexts);
 console.log(JSON.stringify({{plan, searches: collector.planQuerySearches(plan.queries, 100)}}));
@@ -182,16 +184,16 @@ console.log(JSON.stringify({{plan, searches: collector.planQuerySearches(plan.qu
         self.assertTrue(all(row["candidate_limit"] >= 1 for row in result["searches"]))
         self.assertTrue(all(row["raw_keywords"] for row in result["plan"]["queries"]))
 
-    def test_numeric_query_target_expands_relevant_product_terms_to_thirty(self):
+    def test_numeric_query_limit_builds_all_generic_product_families(self):
         collector_path = json.dumps(str(COLLECTOR))
         script = f"""
 const collector = require({collector_path});
 const contexts = [{{
-  asin: 'B003ULL1NQ',
-  title: 'Nutramax Cosequin Joint Supplement for Dogs, Chewable Tablets, 132ct',
-  bullets: ['Contains glucosamine, chondroitin and MSM', 'Daily use for senior and large breed dogs'],
-  amazon_keywords: ['Nutramax Cosequin Joint Supplement for Dogs'],
-  seller_keywords: []
+   asin: 'B0HMGGX71C',
+   title: 'Dog Lick Bowl Slow Feeder with Non-Slip Base',
+   bullets: ['Use with wet food and frozen treats during grooming', 'Helps reduce anxiety and boredom'],
+   amazon_keywords: ['Dog Lick Bowl Slow Feeder'],
+   seller_keywords: ['dog enrichment feeder', 'lick mat alternative']
 }}];
 console.log(JSON.stringify(collector.buildKeywordPlan({{'max-queries': '30'}}, contexts)));
 """
@@ -201,13 +203,13 @@ console.log(JSON.stringify(collector.buildKeywordPlan({{'max-queries': '30'}}, c
         )
         self.assertEqual(run.returncode, 0, run.stderr)
         plan = json.loads(run.stdout)
-        self.assertEqual(plan["source_raw_keyword_count"], 1)
-        self.assertEqual(plan["effective_keyword_count"], 30)
-        self.assertEqual(len(plan["queries"]), 30)
-        self.assertGreaterEqual(plan["derived_keyword_count"], 29)
-        self.assertTrue(all("B003ULL1NQ" in row["asins"] for row in plan["queries"]))
+        self.assertEqual(plan["source_raw_keyword_count"], 3)
+        self.assertGreaterEqual(plan["effective_keyword_count"], 9)
+        self.assertLessEqual(len(plan["queries"]), 30)
+        self.assertGreaterEqual(plan["derived_keyword_count"], 8)
+        self.assertTrue(all("B0HMGGX71C" in row["asins"] for row in plan["queries"]))
         self.assertTrue(any(any(source.startswith("derived:") for source in row["keyword_sources"]) for row in plan["queries"]))
-        self.assertFalse({"dog", "dogs", "joint"}.intersection(row["query"].lower() for row in plan["queries"]))
+        self.assertTrue(all("lick" in row["query"].lower() or "dog" in row["query"].lower() for row in plan["queries"]))
 
     def test_videos_per_query_is_fixed_and_candidates_deduplicate_after_scanning(self):
         collector_path = json.dumps(str(COLLECTOR))
@@ -265,9 +267,9 @@ let peak = 0;
         script = f"""
 const collector = require({collector_path});
 const contexts = [{{
-  asin: 'B003ULL1NQ',
-  amazon_keywords: ['Nutramax Cosequin Joint Supplement for Dogs'],
-  seller_keywords: ['dog', 'joint', 'hip', 'arthritis', 'cosequin']
+  asin: 'B0HMGGX71C',
+  amazon_keywords: ['Dog Lick Bowl Slow Feeder'],
+  seller_keywords: ['food', 'grooming', 'anxiety', 'lick bowl']
 }}];
 console.log(JSON.stringify(collector.buildKeywordPlan({{'max-queries': 'all'}}, contexts)));
 """
@@ -277,22 +279,21 @@ console.log(JSON.stringify(collector.buildKeywordPlan({{'max-queries': 'all'}}, 
         )
         self.assertEqual(run.returncode, 0, run.stderr)
         queries = [row["query"].lower() for row in json.loads(run.stdout)["queries"]]
-        self.assertNotIn("dog", queries)
-        self.assertNotIn("joint", queries)
-        self.assertNotIn("hip", queries)
-        self.assertNotIn("arthritis", queries)
-        self.assertTrue(any("cosequin" in query and "hip" in query for query in queries))
-        self.assertTrue(any("cosequin" in query and "arthritis" in query for query in queries))
+        self.assertNotIn("food", queries)
+        self.assertNotIn("grooming", queries)
+        self.assertNotIn("anxiety", queries)
+        self.assertTrue(any("lick" in query and "grooming" in query for query in queries))
+        self.assertTrue(any("lick" in query and "anxiety" in query for query in queries))
 
     def test_amazon_bullet_queries_keep_the_product_anchor_after_compression(self):
         collector_path = json.dumps(str(COLLECTOR))
         script = f"""
 const collector = require({collector_path});
 const contexts = [{{
-  asin: 'B003ULL1NQ',
+  asin: 'B0HMGGX71C',
   amazon_keywords: [
-    'Nutramax Cosequin Joint Supplement for Dogs',
-    'For Any Breed or Size Whether you have a young or senior dog'
+    'Dog Lick Bowl Slow Feeder',
+    'For grooming or bath time with wet food and frozen treats'
   ],
   seller_keywords: []
 }}];
@@ -304,7 +305,7 @@ console.log(JSON.stringify(collector.buildKeywordPlan({{'max-queries':'2'}}, con
         )
         self.assertEqual(run.returncode, 0, run.stderr)
         queries = json.loads(run.stdout)
-        self.assertIn("cosequin", queries[1]["query"].lower())
+        self.assertIn("lick", queries[1]["query"].lower())
         self.assertLessEqual(len(queries[1]["query"].split()), 8)
 
     def test_comment_loader_stops_at_limit_or_three_stagnant_rounds(self):
@@ -525,31 +526,31 @@ console.log(JSON.stringify(qualityGate(records, 100)));
                 "source_specific": {
                     "record_type": "comment",
                     "video_id": "video-001",
-                    "video_title": "Cosequin review",
+                    "video_title": "Dog lick bowl review",
                     "video_url": "https://www.youtube.com/watch?v=video-001",
                     "channel_title": "Pet Channel",
                     "channel_url": "https://www.youtube.com/@pet-channel",
-                    "amazon_asins": ["B003ULL1NQ"],
-                    "matched_query": "cosequin review",
+                    "amazon_asins": ["B0HMGGX71C"],
+                    "matched_query": "dog lick bowl review",
                     "keyword_sources": ["amazon", "sellersprite"],
                 },
             }
             jsonl_path.write_text(json.dumps(record, ensure_ascii=False) + "\n", encoding="utf-8")
             query_path.write_text(json.dumps({
-                "asins": ["B003ULL1NQ"],
+                "asins": ["B0HMGGX71C"],
                 "created_at": "2026-09-14T02:03:04Z",
                 "raw_keyword_count": 2,
                 "effective_keyword_count": 1,
                 "queries": [{
-                    "query": "cosequin review",
-                    "raw_keywords": ["Cosequin Review", "cosequin reviews"],
+                    "query": "dog lick bowl review",
+                    "raw_keywords": ["Dog Lick Bowl Review", "dog lick bowl reviews"],
                     "keyword_sources": ["amazon", "sellersprite"],
-                    "asins": ["B003ULL1NQ"],
+                    "asins": ["B0HMGGX71C"],
                     "found_video_count": 3,
                 }],
             }, ensure_ascii=False), encoding="utf-8")
             manifest_path.write_text(json.dumps({
-                "asins": ["B003ULL1NQ"],
+                "asins": ["B0HMGGX71C"],
                 "collected_at": "2026-09-14T02:03:04Z",
                 "raw_keyword_count": 2,
                 "effective_keyword_count": 1,

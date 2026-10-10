@@ -1,45 +1,37 @@
-# Comment record schema
+# Raw comment record schema
 
-JSONL is UTF-8 with one public visible comment or reply per row. No video records are valid.
+JSONL is UTF-8 with one public visible comment or reply per row. Standalone video records are invalid.
 
-Required lineage fields (relevance/audit fields are optional diagnostics and never delivery filters):
+Required identity and lineage:
 
 ```json
 {
   "schema_version": "voc_raw_v1",
-  "platform": "youtube",
+  "source": "youtube",
+  "record_type": "comment",
   "source_item_id": "comment:VIDEO_ID:COMMENT_ID",
   "source_parent_id": "video:VIDEO_ID",
-  "asin": "ASIN",
-  "matched_asins": ["ASIN"],
-  "query": "observed or seed query",
-  "matched_keywords": ["query"],
-  "discovery_round": 1,
-  "relevance_tier": "direct_product",
-  "semantic_link": "explicit product or brand mention",
-  "evidence_reason": "matched: product name",
-  "confidence": 0.91,
-  "video_id": "VIDEO_ID",
-  "video_title": "Title",
-  "video_url": "https://www.youtube.com/watch?v=VIDEO_ID",
-  "channel_id": null,
-  "channel_title": "Channel",
-  "channel_url": "https://www.youtube.com/@channel",
   "comment_id": "COMMENT_ID",
   "parent_comment_id": null,
   "depth": 0,
+  "video_id": "VIDEO_ID",
+  "video_title": "Title",
+  "video_url": "https://www.youtube.com/watch?v=VIDEO_ID",
+  "channel_title": "Channel",
+  "channel_url": "https://www.youtube.com/@channel",
+  "amazon_asins": ["ASIN"],
+  "matched_query": "product-driven query",
+  "keyword_sources": ["amazon", "sellersprite", "product_context:use_case"],
   "author": {"handle": "Visible author"},
-  "author_channel_url": "https://www.youtube.com/@author",
-  "body": "Visible comment text",
+  "published_at": "2 weeks ago",
   "like_count": "2",
-  "is_pinned": false,
-  "is_creator_hearted": false,
-  "created_at_or_visible_time": "2 weeks ago",
-  "comment_url": "https://www.youtube.com/watch?v=VIDEO_ID&lc=COMMENT_ID",
-  "collected_at": "2026-09-16T00:00:00Z",
+  "comment_text": "Visible comment text",
+  "collected_at": "ISO-8601",
   "audit_status": "PASS",
   "source_specific": {"record_type": "comment"}
 }
 ```
 
-Every captured row enters raw delivery regardless of relevance tier, audit status, advertising, links, length, or evidence strength. Global technical deduplication uses stable comment ID only; if missing, it uses the exact tuple `video_id + author + comment_text`. It merges lineage for confirmed duplicates and performs no fuzzy deduplication.
+`relevance_tier`, `semantic_link`, `evidence_reason`, `confidence`, and `audit_status` are optional diagnostics and never delivery filters. Advertising, links, short text, generic wording, weak evidence, PASS, PARTIAL, and BLOCKED rows remain in raw output when successfully read.
+
+Technical deduplication uses stable comment ID only. When an ID is absent, use the exact tuple `video_id + author + comment_text`; never fuzzy-match. Manifest counts must reconcile `raw_captured_count`, `technical_duplicate_count`, `final_collected_count`, `main_comment_count`, `reply_count`, `executed_query_count`, `deduplicated_video_count`, and `video_record_count=0`. Quality Gate checks required fields, URLs, parent lineage, duplicate IDs, record type, and JSONL/CSV/Excel count agreement.

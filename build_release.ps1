@@ -1,4 +1,4 @@
-param([string]$Version='1.0.0-rc1')
+param([string]$Version='1.1.0')
 $ErrorActionPreference='Stop';$root=$PSScriptRoot;$dist=Join-Path $root 'dist';$stage=Join-Path $dist "youtube-voc-collector-$Version";$payload=Join-Path $stage 'youtube-voc-collector'
 if(Test-Path $dist){Remove-Item -LiteralPath $dist -Recurse -Force};New-Item -ItemType Directory -Force $payload|Out-Null
 Get-ChildItem $root -Recurse -Directory -Filter __pycache__|Where-Object{$_.FullName -notlike "$dist*"}|Remove-Item -Recurse -Force

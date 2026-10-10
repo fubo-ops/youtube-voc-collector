@@ -3,12 +3,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-class Rc1DistributionTests(unittest.TestCase):
+class ReleaseDistributionTests(unittest.TestCase):
     def test_release_contract_files_exist(self):
         required = ['README.md','LICENSE','CHANGELOG.md','VERSION','SECURITY.md','.gitignore',
                     'install.ps1','install.cmd','doctor.ps1','uninstall.ps1','uninstall.cmd','build_release.ps1']
         self.assertFalse([name for name in required if not (ROOT/name).is_file()])
-        self.assertEqual((ROOT/'VERSION').read_text(encoding='utf-8').strip(),'1.0.0-rc1')
+        self.assertEqual((ROOT/'VERSION').read_text(encoding='utf-8').strip(),'1.1.0')
 
     @unittest.skipUnless(sys.platform == "win32", "Windows PowerShell distribution contract")
     def test_powershell_entrypoints_parse(self):
@@ -23,7 +23,7 @@ class Rc1DistributionTests(unittest.TestCase):
         self.assertTrue(build.is_file())
         run=subprocess.run(['powershell','-NoProfile','-ExecutionPolicy','Bypass','-File',str(build)],capture_output=True,text=True)
         self.assertEqual(run.returncode,0,run.stderr)
-        archive=ROOT/'dist/youtube-voc-collector-1.0.0-rc1.zip'
+        archive=ROOT/'dist/youtube-voc-collector-1.1.0.zip'
         with zipfile.ZipFile(archive) as z:
             names=[n.lower() for n in z.namelist()]
         banned=('outputs/','profile','cookie','token','.pem','.key','__pycache__','.pyc','.log')
