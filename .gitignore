@@ -25,3 +25,12 @@ trace.zip
 SingletonCookie
 SingletonLock
 SingletonSocket
+
+# Complete default output trees and custom checkpoint names
+/YouTube评论采集/
+checkpoint.json
+*_checkpoint.json
+.runtime/
+.coverage
+htmlcov/
+.DS_Store
